@@ -257,6 +257,10 @@ class VLMModelAdapter(nn.Module):
             return self._language_model.args
         return self.config
 
+    @property
+    def dense_kv_attention(self) -> bool:
+        return getattr(self._language_model, "dense_kv_attention", False) is True
+
     def make_cache(self) -> List[Any]:
         """
         Create KV cache using the language model's make_cache().

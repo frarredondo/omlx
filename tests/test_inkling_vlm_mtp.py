@@ -994,3 +994,49 @@ def test_inkling2_keeps_dense_kv_when_kv_quantization_is_on(mock_tokenizer):
     assert not scheduler._turboquant_eligible(model.make_cache())
 
 
+def _inkling2_vlm_adapter():
+    from types import SimpleNamespace
+
+    from omlx.models.vlm import VLMModelAdapter
+    from omlx.patches.inkling2 import vlm as inkling2_vlm
+
+    model = _inkling2_tiny()
+    model.__class__ = inkling2_vlm.Model
+    model.config = SimpleNamespace(
+        model_type=model.model_type,
+        image_token_id=model.args.image_token_id,
+        eos_token_id=None,
+        vocab_size=model.args.text.vocab_size,
+        text_config=model.args.text,
+        vision_config=model.args.vision,
+    )
+    return VLMModelAdapter(model)
+
+
+@pytest.mark.parametrize(
+    "scheme,bits", [("turboquant", 4.0), ("affine4", 4.0), ("affine8", 8.0)]
+)
+def test_inkling2_vlm_engine_keeps_dense_kv(mock_tokenizer, scheme, bits):
+    from omlx.scheduler import Scheduler
+
+    adapter = _inkling2_vlm_adapter()
+    assert adapter.dense_kv_attention is True
+    scheduler = Scheduler(model=adapter, tokenizer=mock_tokenizer)
+    scheduler._turboquant_kv_bits = bits
+    scheduler._turboquant_kv_scheme = scheme
+    assert not scheduler._turboquant_eligible(adapter.make_cache())
+
+
+def test_vlm_adapter_without_dense_kv_flag_stays_eligible(mock_tokenizer):
+    from mlx_lm.models.cache import KVCache
+
+    from omlx.scheduler import Scheduler
+
+    adapter = _inkling2_vlm_adapter()
+    plain = type("PlainLanguageModel", (), {})()
+    adapter._language_model = plain
+    assert adapter.dense_kv_attention is False
+    scheduler = Scheduler(model=adapter, tokenizer=mock_tokenizer)
+    scheduler._turboquant_kv_bits = 8.0
+    scheduler._turboquant_kv_scheme = "affine8"
+    assert scheduler._turboquant_eligible([KVCache(), KVCache()])
