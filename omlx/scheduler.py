@@ -17,6 +17,7 @@ import gc
 import importlib
 import inspect
 import logging
+import os
 import threading
 import time
 from array import array
@@ -1418,6 +1419,112 @@ _TURBOQUANT_KV_CACHE_TYPES = frozenset(
 # The one snapshot source allowed off the block grid.
 _TAIL_SNAPSHOT_SOURCE = "prefill_tail"
 
+_RAM_BOUNDARY_SNAPSHOT_MAX_BYTES = 2 * 1024**3
+_RAM_BOUNDARY_SNAPSHOT_MAX_RAM_FRACTION = 0.10
+_EXTRACTED_SNAPSHOT_MARKER = "__prefill_extracted__"
+
+
+class _StoreEndpoint(NamedTuple):
+    aligned_boundaries: list[int]
+    terminal_token_count: int
+    terminal_is_tail: bool
+
+
+def _is_extracted_snapshot(value: Any) -> bool:
+    return (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and value[0] == _EXTRACTED_SNAPSHOT_MARKER
+        and isinstance(value[1], list)
+    )
+
+
+def _snapshot_nbytes(value: Any) -> int:
+    total = 0
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, mx.array):
+            total += int(item.nbytes)
+        elif isinstance(item, dict):
+            pending.append(item.get("state"))
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
+        elif item is not None and not isinstance(item, (str, bytes, int, float)):
+            state = getattr(item, "state", None)
+            if isinstance(state, (list, tuple)):
+                pending.append(state)
+    return total
+
+
+def _snapshot_restores_independently(value: Any) -> bool:
+    # Plain ArraysCache state is complete at every boundary; composite,
+    # pooling and delta-chained layouts restore only through earlier ones.
+    if not _is_extracted_snapshot(value):
+        return False
+    for layer in value[1]:
+        if not isinstance(layer, dict):
+            return False
+        name = str(layer.get("class_name") or "")
+        if name in _KNOWN_SLICEABLE_CACHE_TYPES:
+            continue
+        if _is_arrays_cache_family(name) and not layer.get("pooling_delta_ranges"):
+            continue
+        return False
+    return True
+
+
+def _is_arrays_cache_family(class_name: str) -> bool:
+    if CacheTypeRegistry is None:
+        return class_name == "ArraysCache"
+    return CacheTypeRegistry.is_arrays_family(class_name)
+
+
+def _owned_copy(array: Any) -> Any:
+    if array.size == 0:
+        return mx.array(array)
+    copy = array * 1
+    return copy if copy.dtype == array.dtype else copy.astype(array.dtype)
+
+
+def _with_owned_arrays(state: Any) -> Any:
+    if isinstance(state, mx.array):
+        return _owned_copy(state)
+    if isinstance(state, list):
+        return [_with_owned_arrays(x) for x in state]
+    if isinstance(state, tuple):
+        return tuple(_with_owned_arrays(x) for x in state)
+    return state
+
+
+def _leaf_arrays(state: Any) -> list[Any]:
+    leaves = []
+    pending = [state]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, mx.array):
+            leaves.append(item)
+        elif isinstance(item, (list, tuple)):
+            pending.extend(item)
+    return leaves
+
+
+def _detach_extracted_snapshot(value: Any) -> Any:
+    # A retained slice keeps its whole source buffer alive (Inkling 2's
+    # sliding windows are views of a larger growth buffer).
+    if not _is_extracted_snapshot(value):
+        return value
+    layers = [
+        dict(layer, state=_with_owned_arrays(layer["state"]))
+        if isinstance(layer, dict) and "state" in layer
+        else layer
+        for layer in value[1]
+    ]
+    copies = [a for layer in layers if isinstance(layer, dict) for a in _leaf_arrays(layer.get("state"))]
+    if copies:
+        mx.eval(*copies)
+    return (value[0], layers)
+
 
 def _is_turboquant_kv_cache(cache_obj: Any) -> bool:
     return type(cache_obj).__name__ in _TURBOQUANT_KV_CACHE_TYPES
@@ -1497,6 +1604,11 @@ def _request_count(request: Any, name: str) -> int:
     """An integer requeue field, or 0 for duck-typed requests."""
     value = getattr(request, name, 0)
     return value if isinstance(value, int) else 0
+
+
+def _prompt_length_without_folded_output(request: Any) -> int:
+    prompt_length = len(getattr(request, "prompt_token_ids", None) or ())
+    return max(0, prompt_length - _request_count(request, "requeued_output_tokens"))
 
 
 def _requeue_row_state(request: Any) -> tuple | None:
@@ -9377,28 +9489,24 @@ class Scheduler:
                     source=source,
                     storage="memory",
                 )
-                self._boundary_cache_snapshots[request_id][token_count] = (
-                    _compact_boundary_snapshot_value(
-                        self._prefill_snapshot_value(snapshot_cache),
-                        token_count,
-                        snapshot_block_size,
-                        self._stream,
-                    )
-                )
                 storage = "memory"
         else:
-            self._boundary_cache_snapshots[request_id][token_count] = (
-                _compact_boundary_snapshot_value(
-                    self._prefill_snapshot_value(snapshot_cache),
-                    token_count,
-                    snapshot_block_size,
-                    self._stream,
-                )
-            )
             storage = "memory"
+        kept_in_ram = storage == "memory" and self._retain_ram_boundary_snapshot(
+            request_id,
+            token_count,
+            _compact_boundary_snapshot_value(
+                self._prefill_snapshot_value(snapshot_cache),
+                token_count,
+                snapshot_block_size,
+                self._stream,
+            ),
+        )
 
         self._boundary_snapshot_required = True
         self._enable_mtp_boundary_alignment()
+        if storage == "memory" and not kept_in_ram:
+            return
         self._boundary_snapshot_diagnostics.record(
             "capture_success",
             request_id=request_id,
@@ -9503,6 +9611,118 @@ class Scheduler:
             block_size,
             self._stream,
         )
+
+    def _ram_snapshot_budget(self) -> int:
+        if getattr(self, "_ram_snapshot_budget_bytes", None) is None:
+            try:
+                ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+            except (ValueError, OSError):
+                ram = 16 * 1024**3
+            self._ram_snapshot_budget_bytes = min(
+                _RAM_BOUNDARY_SNAPSHOT_MAX_BYTES,
+                int(ram * _RAM_BOUNDARY_SNAPSHOT_MAX_RAM_FRACTION),
+            )
+        return int(self._ram_snapshot_budget_bytes)
+
+    @property
+    def _ram_snapshot_charges(self) -> dict[tuple[str, int], int]:
+        return self.__dict__.setdefault("_ram_snapshot_charge_bytes", {})
+
+    def _release_ram_snapshot_charges(self) -> None:
+        inflight = getattr(self, "_inflight_store_futures", None) or {}
+        for request_id, token_count in list(self._ram_snapshot_charges):
+            snapshots = self._boundary_cache_snapshots.get(request_id)
+            if snapshots is not None:
+                still_held = snapshots.get(token_count) is not None
+            else:
+                # An async store job keeps a finished request's snapshots.
+                still_held = request_id in inflight
+            if not still_held:
+                del self._ram_snapshot_charges[(request_id, token_count)]
+
+    def _snapshots_the_store_can_still_choose(
+        self, request_id: str, token_counts: set[int]
+    ) -> set[int]:
+        if not token_counts or self.config.paged_cache_block_size <= 0:
+            return set(token_counts)
+        request = self.requests.get(request_id)
+        newest = max(token_counts)
+        prompt_length = _prompt_length_without_folded_output(request)
+        shared_prefix_ends = {
+            getattr(request, "system_prefix_end", 0) or 0,
+            getattr(request, "junction_end", 0) or 0,
+        }
+        terminals = {
+            self._boundary_store_endpoint(
+                request, token_counts, store_length, stop_at_generation_prompt=stop
+            ).terminal_token_count
+            for store_length in {newest, prompt_length} - {0}
+            for stop in (True, False)
+        }
+        return {newest} | ((shared_prefix_ends | terminals) & token_counts)
+
+    def _evictable_ram_snapshots(self, request_id: str, new_token_count: int) -> list[int]:
+        snapshots = self._boundary_cache_snapshots.get(request_id, {})
+        keep = self._snapshots_the_store_can_still_choose(
+            request_id, set(snapshots) | {new_token_count}
+        )
+        return sorted(
+            tc
+            for tc in snapshots
+            if (request_id, tc) in self._ram_snapshot_charges and tc not in keep
+        )
+
+    def _skip_ram_snapshot(
+        self, request_id: str, token_count: int, reason: str, nbytes: int
+    ) -> bool:
+        self._boundary_snapshot_diagnostics.record(
+            "capture_skipped",
+            reason=reason,
+            request_id=request_id,
+            token_count=token_count,
+            block_size=self.config.paged_cache_block_size,
+            source="memory",
+        )
+        logger.debug(
+            "Skipped in-memory boundary snapshot for %s at %s tokens "
+            "(%s, %.1f MiB, budget %.1f MiB)",
+            request_id,
+            token_count,
+            reason,
+            nbytes / 2**20,
+            self._ram_snapshot_budget() / 2**20,
+        )
+        return False
+
+    def _retain_ram_boundary_snapshot(
+        self, request_id: str, token_count: int, value: Any
+    ) -> bool:
+        snapshots = self._boundary_cache_snapshots.setdefault(request_id, {})
+        if not _snapshot_restores_independently(value):
+            # Chained layouts need every earlier boundary; they keep the
+            # unbudgeted fallback.
+            snapshots[token_count] = value
+            return True
+        self._release_ram_snapshot_charges()
+        charges = self._ram_snapshot_charges
+        nbytes = _snapshot_nbytes(value)
+        evictable = self._evictable_ram_snapshots(request_id, token_count)
+        budget = self._ram_snapshot_budget()
+        used = sum(charges.values())
+        if used - sum(charges[(request_id, tc)] for tc in evictable) + nbytes > budget:
+            return self._skip_ram_snapshot(
+                request_id, token_count, "ram_snapshot_budget", nbytes
+            )
+        for tc in evictable:
+            if used + nbytes <= budget:
+                break
+            # Store and restore treat a missing intermediate boundary as a placeholder.
+            used -= charges.pop((request_id, tc))
+            del snapshots[tc]
+        with mx.stream(self._stream):
+            snapshots[token_count] = _detach_extracted_snapshot(value)
+        charges[(request_id, token_count)] = nbytes
+        return True
 
     def _extract_prefill_snapshot_states(
         self, snapshot_cache: list[Any]
@@ -9797,25 +10017,23 @@ class Scheduler:
                     source="decode",
                     storage="memory",
                 )
-                # In-memory fallback: the store-cache worker slices this snapshot
-                # off-thread (via _BoundarySnapshotProvider -> _extract_cache_states).
-                # MLX streams are thread-local, so force the leaves concrete now on
-                # the capturing thread; otherwise the worker re-dispatches a lazy op
-                # to this thread's stream index -> "no Stream(gpu, N)" -> SIGABRT.
-                # Mirrors _on_prefill_boundary_snapshot's in-memory fallback.
-                self._boundary_cache_snapshots[request.request_id][total_tokens] = (
-                    self._decode_boundary_snapshot_value(
-                        snapshot_cache, total_tokens, snapshot_block_size
-                    )
-                )
                 storage = "memory"
         else:
-            self._boundary_cache_snapshots[request.request_id][total_tokens] = (
+            storage = "memory"
+        if storage == "memory":
+            # The store-cache worker slices this snapshot off-thread (via
+            # _BoundarySnapshotProvider -> _extract_cache_states). MLX streams
+            # are thread-local, so its leaves must be concrete before it leaves
+            # this thread, or the worker re-dispatches a lazy op to this
+            # thread's stream index -> "no Stream(gpu, N)" -> SIGABRT.
+            if not self._retain_ram_boundary_snapshot(
+                request.request_id,
+                total_tokens,
                 self._decode_boundary_snapshot_value(
                     snapshot_cache, total_tokens, snapshot_block_size
-                )
-            )
-            storage = "memory"
+                ),
+            ):
+                return
 
         self._boundary_snapshot_diagnostics.record(
             "capture_success",
@@ -9828,6 +10046,47 @@ class Scheduler:
         logger.debug(
             f"Captured boundary cache snapshot for {request.request_id} at "
             f"{total_tokens} tokens ({storage})"
+        )
+
+    def _boundary_store_endpoint(
+        self,
+        request: Any,
+        counts: Any,
+        total_tokens: int,
+        *,
+        stop_at_generation_prompt: bool = True,
+        system_tail: bool = False,
+    ) -> _StoreEndpoint:
+        block_size = self.config.paged_cache_block_size
+        # The newest tail competes with aligned snapshots for the terminal slot.
+        # Unless the template keeps the generation prompt, stop at the marker.
+        limit = total_tokens
+        marker = getattr(request, "generation_prompt_start", 0) or 0
+        if (
+            stop_at_generation_prompt
+            and 0 < marker < limit
+            and not getattr(request, "generation_prompt_persists", False)
+        ):
+            limit = marker
+        valid_counts = sorted(
+            tc for tc in counts if 0 < tc <= limit and tc % block_size == 0
+        )
+        shared_ends = {
+            getattr(request, "system_prefix_end", 0) or 0,
+            getattr(request, "junction_end", 0) or 0,
+        }
+        tail_counts = [
+            tc
+            for tc in counts
+            if 0 < tc <= limit
+            and tc % block_size != 0
+            and (tc in shared_ends) == system_tail
+        ]
+        latest_aligned = valid_counts[-1] if valid_counts else 0
+        latest_tail = max(tail_counts) if tail_counts else 0
+        tail_terminal = latest_tail > latest_aligned
+        return _StoreEndpoint(
+            valid_counts, latest_tail if tail_terminal else latest_aligned, tail_terminal
         )
 
     def _get_boundary_store_override(
@@ -9885,39 +10144,17 @@ class Scheduler:
             miss("invalid_block_size", len(snapshots))
             return None
 
-        # The newest tail competes with aligned snapshots for the terminal slot.
-        # Unless the template keeps the generation prompt, stop at the marker.
-        limit = total_tokens
         request = self.requests.get(request_id)
-        marker = getattr(request, "generation_prompt_start", 0) or 0
-        if (
-            stop_at_generation_prompt
-            and 0 < marker < limit
-            and not getattr(request, "generation_prompt_persists", False)
-        ):
-            limit = marker
-        valid_counts = sorted(
-            tc for tc in snapshots if 0 < tc <= limit and tc % block_size == 0
+        valid_counts, latest_tc, tail_terminal = self._boundary_store_endpoint(
+            request,
+            snapshots,
+            total_tokens,
+            stop_at_generation_prompt=stop_at_generation_prompt,
+            system_tail=system_tail,
         )
-        shared_ends = {
-            getattr(request, "system_prefix_end", 0) or 0,
-            getattr(request, "junction_end", 0) or 0,
-        }
-        tail_counts = [
-            tc
-            for tc in snapshots
-            if 0 < tc <= limit
-            and tc % block_size != 0
-            and (tc in shared_ends) == system_tail
-        ]
-        if not valid_counts and not tail_counts:
+        if not latest_tc:
             miss("no_aligned_snapshots", len(snapshots))
             return None
-
-        latest_aligned = valid_counts[-1] if valid_counts else 0
-        latest_tail = max(tail_counts) if tail_counts else 0
-        tail_terminal = latest_tail > latest_aligned
-        latest_tc = latest_tail if tail_terminal else latest_aligned
 
         # Load latest snapshot — may be on SSD (None marker) or in memory.
         #
@@ -10334,8 +10571,8 @@ class Scheduler:
             prompt_tokens += list(getattr(request, "output_token_ids", None) or [])[
                 folded_output_tokens:
             ]
-        elif folded_output_tokens:
-            prompt_tokens = prompt_tokens[:-folded_output_tokens]
+        else:
+            prompt_tokens = prompt_tokens[: _prompt_length_without_folded_output(request)]
         boundary_override = self._get_boundary_store_override(request_id, prompt_tokens)
         if boundary_override is not None:
             (
@@ -14869,7 +15106,7 @@ class Scheduler:
                                     # turn, so it can never prefix-match.
                                     cacheable_sequence = list(
                                         request.prompt_token_ids[
-                                            : len(request.prompt_token_ids) - folded
+                                            : _prompt_length_without_folded_output(request)
                                         ]
                                     )
                                 token_sequence_to_store = cacheable_sequence

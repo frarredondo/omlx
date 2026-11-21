@@ -340,6 +340,16 @@ def test_prefill_snapshot_decoupled_from_live_cache():
         lambda: Scheduler._enable_mtp_boundary_alignment(stub)
     )
     stub._eval_snapshot_cache = lambda caches: None
+    stub._ram_snapshot_charges = {}
+    stub._release_ram_snapshot_charges = (
+        lambda: Scheduler._release_ram_snapshot_charges(stub)
+    )
+    stub._ram_snapshot_budget = lambda: Scheduler._ram_snapshot_budget(stub)
+    stub._retain_ram_boundary_snapshot = (
+        lambda rid, tc, value: Scheduler._retain_ram_boundary_snapshot(
+            stub, rid, tc, value
+        )
+    )
 
     Scheduler._on_prefill_boundary_snapshot(stub, "req-alias", [live], BLOCK_SIZE)
 
@@ -815,6 +825,9 @@ def test_glm_pm_promoted_boundary_preserves_pooling_history(tmp_path, refill, nu
     stub.paged_ssd_cache_manager = ssd
     stub.requests = {}
     stub._PREFILL_SNAPSHOT_MARKER = Scheduler._PREFILL_SNAPSHOT_MARKER
+    stub._boundary_store_endpoint = (
+        lambda *args, **kwargs: Scheduler._boundary_store_endpoint(stub, *args, **kwargs)
+    )
     stub._boundary_cache_snapshots = {
         "promoted": {
             tc: (Scheduler._PREFILL_SNAPSHOT_MARKER, snapshot)
