@@ -16,7 +16,10 @@ The state holds the ``window - 1`` keys the next token can still reach.
 Appending writes into a buffer with room to grow, so a decode step copies
 nothing; the buffer is re-cut once per ``window`` tokens. Keys are only ever
 dropped in whole attention tiles, which keeps the prefill kernel's tiles where
-a cache of every key would have them and the output bit-identical to it.
+a cache of every key would have them, so a single row's output is
+bit-identical to it. Joining rows of different lengths, then extracting and
+restoring one, can shift its keys to another tile grid: differences at the
+level of FP16 rounding in the BF16 flash prefill.
 """
 
 from __future__ import annotations
