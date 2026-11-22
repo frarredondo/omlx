@@ -828,6 +828,9 @@ def test_glm_pm_promoted_boundary_preserves_pooling_history(tmp_path, refill, nu
     stub._boundary_store_endpoint = (
         lambda *args, **kwargs: Scheduler._boundary_store_endpoint(stub, *args, **kwargs)
     )
+    stub._superseded_tail_end = (
+        lambda *args, **kwargs: Scheduler._superseded_tail_end(stub, *args, **kwargs)
+    )
     stub._boundary_cache_snapshots = {
         "promoted": {
             tc: (Scheduler._PREFILL_SNAPSHOT_MARKER, snapshot)

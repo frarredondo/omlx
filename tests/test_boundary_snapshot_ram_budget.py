@@ -236,3 +236,36 @@ def test_charges_stay_while_an_async_store_owns_the_snapshots(mock_tokenizer):
     del scheduler._inflight_store_futures["a"]
     assert scheduler._retain_ram_boundary_snapshot("b", 8, _snapshot())
     assert set(scheduler._ram_snapshot_charges) == {("b", 8)}
+
+
+def test_superseded_prompt_tail_is_kept_for_its_shared_store(mock_tokenizer):
+    _, scheduler = _scheduler(mock_tokenizer, budget=3 * UNIT)
+    prompt_tail = BLOCK + 4
+    prompt = list(range(prompt_tail + 1))
+    request = _request(scheduler, prompt_token_ids=prompt, prompt_tail_end=prompt_tail)
+    for tc in (BLOCK, prompt_tail, 2 * BLOCK, 3 * BLOCK):
+        assert scheduler._retain_ram_boundary_snapshot("req", tc, _snapshot())
+    assert _kept(scheduler) == [BLOCK, prompt_tail, 3 * BLOCK]
+    shared_stores = scheduler._prepare_shared_tail_stores(request, [])
+    assert [tokens for tokens, *_ in shared_stores] == [prompt[:prompt_tail]]
+
+
+def test_prompt_only_store_keeps_its_terminal_once_a_boundary_supersedes_the_tail(
+    mock_tokenizer,
+):
+    _, scheduler = _scheduler(mock_tokenizer, budget=2 * UNIT)
+    prompt = list(range(BLOCK + 5))
+    request = _request(scheduler, prompt_token_ids=prompt)
+
+    def retain(request_id, _cache, token_count, **_):
+        scheduler._retain_ram_boundary_snapshot(request_id, token_count, _snapshot())
+
+    retain("other", None, BLOCK)
+    retain("req", None, BLOCK)
+    with patch.object(scheduler, "_on_prefill_boundary_snapshot", side_effect=retain):
+        scheduler._emit_prefill_tail_snapshot(request, [], BLOCK + 4)
+    del scheduler._boundary_cache_snapshots["other"]
+    retain("req", None, 2 * BLOCK)
+
+    result = scheduler._get_boundary_store_override("req", prompt)
+    assert result is not None and result[0] == prompt[:BLOCK]
